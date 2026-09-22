@@ -1,32 +1,45 @@
 #!/bin/bash
-# claude-awake — keep a MacBook from sleeping on lid close while Claude Code CLI runs.
+# claude-awake — keep a MacBook from sleeping on lid close while a Claude
+# session is working.
 #
 # macOS forces sleep when the lid closes regardless of caffeinate. The only
-# switch that overrides that is `pmset -a disablesleep 1` (root). This tool
-# flips it on while any Claude Code CLI process is alive and back off shortly
-# after they all exit, so the laptop does not stay hot in a bag forever.
+# switch that overrides that is `pmset -a disablesleep` (root). This tool
+# flips it on while a Claude session is alive and back off shortly after, so
+# the laptop does not stay hot in a bag forever.
 #
-#   claude-awake status     show switch state + whether Claude Code is running
-#   claude-awake on         hold the switch on until `off` (daemon won't undo it)
+# Only one poller may own the switch at a time: this daemon, or the menu bar
+# app (ClaudeAwake.app). `install` refuses to create a second one, and the
+# daemon takes a PID lock as a backstop.
+#
+#   claude-awake status     switch state, sessions seen, and any conflict
+#   claude-awake on         hold the switch on until `off`
 #   claude-awake off        release the hold and re-enable sleep now
-#   claude-awake install    write + load the LaunchAgent (prints the sudoers step if missing)
+#   claude-awake install    write + load the LaunchAgent (refuses on conflict)
 #   claude-awake uninstall  unload the LaunchAgent and re-enable sleep
 #   claude-awake daemon     poll loop (run by the LaunchAgent, not by hand)
+#
+# install/uninstall take --force to act despite a detected conflict.
 set -u
 STATE_DIR="$HOME/.local/state/claude-awake"
+ARMED="$STATE_DIR/armed"
 HOLD="$STATE_DIR/hold"
+PIDFILE="$STATE_DIR/daemon.pid"
 LABEL="com.glitchwizard.claude-awake"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/claude-awake.log"
 SUDOERS=/etc/sudoers.d/claude-awake
+APP_EXEC='ClaudeAwake.app/Contents/MacOS/ClaudeAwake'
 POLL=30          # seconds between checks
 GRACE=3          # consecutive empty polls before sleep is re-enabled (~90s)
 mkdir -p "$STATE_DIR"
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- the switch
 
 sleep_disabled() {  # exit 0 = switch is ON (sleep disabled)
-  pmset -g 2>/dev/null | grep -qE '^ *SleepDisabled +1'
+  pmset -g 2>/dev/null | grep -qE '^[[:space:]]*SleepDisabled[[:space:]]+1[[:space:]]*$'
 }
 
 have_sudo_rule() { sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; }
@@ -42,24 +55,78 @@ set_switch() {      # 1 or 0
 
 claude_running() {
   # Claude Code CLI processes: brew/npm `claude`, the VS Code extension's
-  # native binary, and bg-pty-host children. Excludes the Claude desktop app.
+  # native binary, and bg-pty-host children (desktop-app local sessions).
+  # The desktop app merely being open is deliberately excluded.
   ps -axo command= \
     | grep -vE 'Claude\.app|Claude Helper|grep' \
     | grep -qE '(^|/)claude(\.exe)?( |$)|@anthropic-ai/claude-code|native-binary/claude|bg-pty-host'
 }
 
+# ------------------------------------------------------- conflict detection
+
+agent_loaded() { launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; }
+
+app_running() { pgrep -f "$APP_EXEC" >/dev/null 2>&1; }
+
+# A live daemon other than this process. Verifies the pid is not only alive
+# but actually ours: pids are recycled, and a stale file would otherwise
+# block every future install.
+other_daemon_pid() {
+  [ -f "$PIDFILE" ] || return 1
+  local p; p=$(head -1 "$PIDFILE" 2>/dev/null) || return 1
+  case ${p:-x} in ''|*[!0-9]*) return 1 ;; esac
+  [ "$p" = "$$" ] && return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  ps -p "$p" -o command= 2>/dev/null | grep -q 'claude-awake' || return 1
+  printf '%s\n' "$p"
+}
+
+# Path the loaded/on-disk plist actually runs, for spotting an install that
+# points at a different copy of this script.
+plist_target() {
+  [ -f "$PLIST" ] || return 1
+  /usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null
+}
+
+conflicts() {   # prints one line per conflict; empty output = clear
+  local pid target self
+  app_running && printf '%s\n' "the menu bar app (ClaudeAwake.app) is running"
+  pid=$(other_daemon_pid) && printf '%s\n' "another claude-awake daemon is running (pid $pid)"
+  if agent_loaded; then printf '%s\n' "the LaunchAgent $LABEL is already loaded"; fi
+  if target=$(plist_target); then
+    self=$(readlink -f "$0")
+    [ "$target" != "$self" ] && printf '%s\n' "an existing plist runs a different copy: $target"
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------ actions
+
 status() {
   if sleep_disabled; then echo "lid-close sleep: DISABLED (laptop stays awake)"; else echo "lid-close sleep: enabled (normal)"; fi
-  if claude_running; then echo "claude code cli: running"; else echo "claude code cli: not running"; fi
-  [ -e "$HOLD" ] && echo "manual hold: ON (run 'claude-awake off' to release)"
-  if have_sudo_rule; then echo "sudoers rule: ok"; else echo "sudoers rule: MISSING ($SUDOERS)"; fi
-  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "launch agent: loaded"; else echo "launch agent: not loaded"; fi
+  if claude_running; then echo "claude session:  working"; else echo "claude session:  none"; fi
+  [ -e "$ARMED" ] && echo "auto mode:       armed"
+  [ -e "$HOLD" ] && echo "manual hold:     ON (run 'claude-awake off' to release)"
+  if have_sudo_rule; then echo "sudoers rule:    ok"; else echo "sudoers rule:    MISSING ($SUDOERS)"; fi
+  if agent_loaded; then echo "launch agent:    loaded"; else echo "launch agent:    not loaded"; fi
+  if app_running; then echo "menu bar app:    running"; else echo "menu bar app:    not running"; fi
+  local pid; pid=$(other_daemon_pid) && echo "daemon:          running (pid $pid)"
+  # Two pollers is the one state that actually misbehaves: they race the switch.
+  if app_running && { agent_loaded || other_daemon_pid >/dev/null; }; then
+    echo
+    echo "WARNING: two pollers own the switch. Quit the app, or run 'claude-awake uninstall'."
+  fi
 }
 
 daemon() {
+  local other; other=$(other_daemon_pid) && { log "another daemon is running (pid $other); exiting without touching the switch"; exit 0; }
+  if app_running; then log "the menu bar app is running; exiting without touching the switch"; exit 0; fi
+  # The trap is installed only after the lock is ours, so an exit taken
+  # because someone else owns the switch cannot turn their wake lock off.
+  printf '%s\n' "$$" > "$PIDFILE"
+  trap 'log "daemon exiting"; [ -e "$HOLD" ] || set_switch 0; rm -f "$PIDFILE"; exit 0' TERM INT EXIT
   local misses=0
-  trap 'log "daemon exiting"; [ -e "$HOLD" ] || set_switch 0; exit 0' TERM INT EXIT
-  log "daemon started (poll=${POLL}s grace=$((POLL*GRACE))s)"
+  log "daemon started (pid $$, poll=${POLL}s grace=$((POLL*GRACE))s)"
   while :; do
     if [ -e "$HOLD" ] || claude_running; then
       misses=0
@@ -82,15 +149,31 @@ write_plist() {
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array><string>$self</string><string>daemon</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>$LOG</string>
   <key>StandardErrorPath</key><string>$LOG</string>
 </dict></plist>
 PL
-  plutil -lint "$PLIST" >/dev/null
+  plutil -lint "$PLIST" >/dev/null || die "generated plist failed validation: $PLIST"
 }
 
 install_agent() {
+  local force=${1:-}
+  local found; found=$(conflicts)
+  if [ -n "$found" ] && [ "$force" != "--force" ]; then
+    echo "Not installing. Found an existing setup:"
+    printf '%s\n' "$found" | sed 's/^/  - /'
+    cat <<MSG
+
+Only one poller may own the sleep switch. Pick one:
+  - keep the menu bar app  : do nothing here (the app needs no LaunchAgent)
+  - switch to the daemon    : quit the app from its menu, then re-run this
+  - reload the daemon only  : claude-awake install --force
+MSG
+    return 1
+  fi
+  [ -n "$found" ] && { echo "--force: replacing the existing setup:"; printf '%s\n' "$found" | sed 's/^/  - /'; }
+
   if ! have_sudo_rule; then
     cat <<MSG
 The passwordless pmset rule is missing. Run this once (it asks for your password):
@@ -102,14 +185,35 @@ then re-run: claude-awake install
 MSG
     return 1
   fi
+
   write_plist
+  # bootout first so a reload is deterministic; ignore "not loaded".
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
-  launchctl bootstrap "gui/$(id -u)" "$PLIST" && echo "launch agent loaded: $LABEL" && status
+  rm -f "$PIDFILE"
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST"; then
+    echo "launch agent loaded: $LABEL"
+  else
+    die "launchctl bootstrap failed for $PLIST"
+  fi
+  echo
+  status
 }
 
 uninstall_agent() {
+  local force=${1:-}
+  if app_running && [ "$force" != "--force" ]; then
+    cat <<MSG
+The menu bar app is running and would immediately re-apply its own setting,
+so re-enabling sleep here would not stick. Quit the app from its menu first,
+or pass --force to remove the LaunchAgent and leave the app alone.
+MSG
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null && echo "(LaunchAgent unloaded; the app keeps managing the switch.)"
+    rm -f "$PLIST"
+    return 0
+  fi
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
-  rm -f "$PLIST" "$HOLD"; set_switch 0
+  rm -f "$PLIST" "$PIDFILE" "$HOLD" "$ARMED"
+  set_switch 0
   echo "agent unloaded; sleep re-enabled. To remove the sudo rule: sudo rm $SUDOERS"
 }
 
@@ -118,7 +222,7 @@ case "${1:-status}" in
   on)        touch "$HOLD"; set_switch 1 && echo "held awake until 'claude-awake off'" ;;
   off)       rm -f "$HOLD"; set_switch 0 ;;
   daemon)    daemon ;;
-  install)   install_agent ;;
-  uninstall) uninstall_agent ;;
-  *) sed -n '2,15p' "$0"; exit 2 ;;
+  install)   install_agent "${2:-}" ;;
+  uninstall) uninstall_agent "${2:-}" ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
 esac
