@@ -66,7 +66,16 @@ ln -s "$PWD/claude-awake" ~/.local/bin/claude-awake
 | `claude-awake install` | Write and load a LaunchAgent that polls without the menu bar app |
 | `claude-awake uninstall` | Unload the agent, re-enable sleep, remove the plist |
 
-The CLI and the app share their state under `~/.local/state/claude-awake`, so `on` and `off` are reflected in the menu. Do not run `claude-awake install` while the menu bar app is running: two pollers would fight over the switch. Pick one.
+The CLI and the app share their state under `~/.local/state/claude-awake`, so `on` and `off` are reflected in the menu.
+
+## Only one owner of the switch
+
+Two pollers racing over `pmset` is the one state that actually misbehaves, so both sides check for each other:
+
+- `claude-awake install` refuses when the menu bar app is running, when a daemon already holds the PID lock, when the LaunchAgent is already loaded, or when an existing plist runs a different copy of the script. It names what it found and offers the three ways out. `--force` overrides it.
+- `claude-awake daemon` takes a PID lock and exits immediately if the app or another daemon owns the switch. It installs its cleanup handler only after the lock is its own, so an exit taken because someone else is in charge can never turn off their wake lock. A stale, recycled, or malformed PID file is ignored rather than blocking every future install.
+- The app shows a conflict line and a warning icon when it finds a daemon or a loaded LaunchAgent.
+- `claude-awake uninstall` will not pointlessly re-enable sleep while the app is running, since the app would just re-apply its own setting. It removes the LaunchAgent and says so.
 
 ## Caveats
 

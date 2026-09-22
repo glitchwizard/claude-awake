@@ -122,6 +122,31 @@ enum Sessions {
     }
 }
 
+// MARK: - Conflict detection
+
+/// Only one poller may own the sleep switch. The CLI refuses to install a
+/// LaunchAgent while this app runs; this is the same check from the app's side,
+/// so a daemon installed with --force is visible here instead of silently
+/// racing us over `pmset`.
+enum Conflicts {
+    static var daemon: String? {
+        let uid = getuid()
+        if run("/bin/launchctl", ["print", "gui/\(uid)/com.glitchwizard.claude-awake"]).0 == 0 {
+            return "a claude-awake LaunchAgent is loaded"
+        }
+        let pidFile = stateDir + "/daemon.pid"
+        guard let raw = try? String(contentsOfFile: pidFile, encoding: .utf8),
+              let pid = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0
+        else { return nil }
+        // A pid alone proves nothing: pids are recycled. Confirm it is ours.
+        let (status, out) = run("/bin/ps", ["-p", String(pid), "-o", "command="])
+        if status == 0 && out.contains("claude-awake") {
+            return "a claude-awake daemon is running (pid \(pid))"
+        }
+        return nil
+    }
+}
+
 // MARK: - The menu bar app
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -137,6 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let loginItem = NSMenuItem(title: "Open at login", action: #selector(toggleLogin), keyEquivalent: "")
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let detectedLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let conflictLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let setupItem = NSMenuItem(title: "Finish setup: copy the sudo command", action: #selector(copySetupCommand), keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -150,9 +176,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupItem.target = self
         statusLine.isEnabled = false
         detectedLine.isEnabled = false
+        conflictLine.isEnabled = false
 
         menu.addItem(statusLine)
         menu.addItem(detectedLine)
+        menu.addItem(conflictLine)
         menu.addItem(.separator())
         menu.addItem(armedItem)
         menu.addItem(holdItem)
@@ -203,8 +231,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let preventing = PowerSwitch.sleepDisabled
         let canSwitch = PowerSwitch.canSwitch
 
+        let conflict = Conflicts.daemon
+
         let symbol: String
-        if !canSwitch { symbol = "exclamationmark.triangle" }
+        if !canSwitch || conflict != nil { symbol = "exclamationmark.triangle" }
         else if preventing { symbol = "bolt.fill" }
         else if armed || holding { symbol = "bolt" }
         else { symbol = "bolt.slash" }
@@ -216,7 +246,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItem.button?.toolTip = description
 
-        if !canSwitch {
+        if let conflict = conflict {
+            statusLine.title = "Conflict: " + conflict
+        } else if !canSwitch {
             statusLine.title = "Setup not finished — cannot change sleep"
         } else if holding {
             statusLine.title = "Awake: held on until you turn it off"
@@ -231,6 +263,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         detectedLine.title = lastDetection.active
             ? "Seen now: " + lastDetection.labels.joined(separator: ", ")
             : "Seen now: no Claude sessions"
+
+        if let conflict = conflict {
+            conflictLine.title = "Two pollers fight over the switch — run: claude-awake uninstall"
+            conflictLine.isHidden = false
+            appendLog("WARNING: conflict — " + conflict)
+        } else {
+            conflictLine.isHidden = true
+        }
 
         armedItem.state = armed ? .on : .off
         holdItem.state = holding ? .on : .off
